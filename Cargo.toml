@@ -1,0 +1,16 @@
+[package]
+name = "stargrid"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures-util = "0.3.30"
+json = "0.12.4"
+log = "0.4.20"
+primitive-types = "0.12.2"
+simplelog = "0.12.1"
+thiserror = "1.0.56"
+tokio.features = ["full"]
+tokio.version = "1.35.1"
+tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-native-roots"] }
+tungstenite = { version = "0.21.0", features = ["rustls-tls-native-roots"] }
