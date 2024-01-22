@@ -3,7 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum StargridError {
   #[error("Invalid Block format")]
-  InvalidBlockFormat,
+  InvalidBlockFormat(String),
 
   #[error("Invalid WebSocket message: {0}")]
   InvalidWSMessage(String),
@@ -22,6 +22,9 @@ pub enum StargridError {
 
   #[error("{0}")]
   Assertion(String),
+
+  #[error("Aggregate error: {0:?}")]
+  Aggregate(Vec<StargridError>),
 }
 
 impl From<String> for StargridError {

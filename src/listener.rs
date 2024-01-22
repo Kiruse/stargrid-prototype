@@ -3,15 +3,15 @@ use std::task::Poll;
 use futures_util::{SinkExt, StreamExt, Future};
 use json::{object, array};
 use log::*;
-use primitive_types::U256;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream, MaybeTlsStream};
 use tungstenite::Message;
 use tungstenite::protocol::CloseFrame;
 
 use crate::Result;
-use crate::data::parse_block;
+use crate::data::{parse_block, Block};
 use crate::error::StargridError;
+use crate::publisher::Publisher;
 
 enum ListenerState {
   /// before any connection attempt has taken place
@@ -24,10 +24,20 @@ enum ListenerState {
   Closed,
 }
 
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum ListenerEvents {
+  Connect,
+  Reconnect,
+  NewBlock(Block),
+  Disconnect,
+  Close,
+}
+
 /// listener connects to the blockchain full node and listens for new blocks
 pub struct Listener {
   state: ListenerState,
   remote: String,
+  publisher: Publisher<ListenerEvents>,
 }
 
 impl Listener {
@@ -35,24 +45,29 @@ impl Listener {
     Self {
       state: ListenerState::Initial,
       remote: endpoint.into(),
+      publisher: Publisher::new(),
     }
   }
 
-  pub async fn run(self: &mut Self) -> Result<()> {
+  pub async fn run(&mut self) -> Result<()> {
     self.open().await?;
 
     loop {
       let res = self.next().await;
       match res {
-        Ok(Some(msg)) => self.handle_message(msg).await?,
+        Ok(Some(msg)) => {
+          if let Err(res) = self.handle_message(msg).await {
+            error!("Error parsing subscription message: {:?}", res);
+          }
+        },
         Ok(None) => {
           info!("closed");
-          self.state = ListenerState::Closed;
+          (*self).state = ListenerState::Closed;
           break;
         }
         Err(e) => {
           error!("Error: {:?}. Reconnecting.", e);
-          self.state = ListenerState::Disconnected;
+          (*self).state = ListenerState::Disconnected;
           self.open().await?;
         }
       }
@@ -61,7 +76,7 @@ impl Listener {
     Ok(())
   }
 
-  async fn handle_message(self: &mut Self, msg: Message) -> Result<()> {
+  async fn handle_message(&mut self, msg: Message) -> Result<()> {
     let ListenerState::Connected(ref mut ws) = self.state else {
       return Err(StargridError::Assertion("Received message while not connected".into()));
     };
@@ -79,8 +94,11 @@ impl Listener {
       }
       Message::Binary(_) => error!("Unexpected binary message, skipping"),
       Message::Text(msg) => {
-        let _block = parse_block(msg.as_str())?;
-        todo!();
+        let block = parse_block(msg.as_str())?;
+        let res = self.publisher.publish(ListenerEvents::NewBlock(block));
+        if let Err(err) = res {
+          error!("Error(s) during block repeating: {:?}", err);
+        }
       }
       _ => todo!(),
     }
@@ -88,11 +106,12 @@ impl Listener {
     Ok(())
   }
 
-  async fn open(self: &mut Self) -> Result<()> {
+  async fn open(&mut self) -> Result<()> {
     if let ListenerState::Connected(_) = self.state {
       return Ok(());
     }
 
+    // establish initial connection
     let (mut ws, res) = connect_async_tls_with_config(
       self.remote.clone(),
       None,
@@ -106,6 +125,8 @@ impl Listener {
     }
 
     info!("Connected to {}", self.remote);
+
+    // subscribe to NewBlock events
     ws.send(Message::Text(json::stringify(object! {
       "jsonrpc" => "2.0",
       "id" => 1,
@@ -130,26 +151,40 @@ impl Listener {
       }
     }
 
+    let event = if let ListenerState::Disconnected = self.state {
+      ListenerEvents::Reconnect
+    } else {
+      ListenerEvents::Connect
+    };
     self.state = ListenerState::Connected(ws);
+    self.publisher.publish(event)?;
     Ok(())
   }
 
-  pub async fn close(self: &mut Self) -> Result<()> {
+  pub async fn close(&mut self) -> Result<()> {
+    let was_closed = if let ListenerState::Closed = self.state { true } else { false };
     if let ListenerState::Connected(ref mut ws) = self.state {
       ws.close(None).await?;
     }
     self.state = ListenerState::Closed;
+    if !was_closed {
+      self.publisher.publish(ListenerEvents::Close)?;
+    }
     Ok(())
   }
 
-  pub fn is_open(self: &Self) -> bool {
+  pub fn events(&mut self) -> &mut Publisher<ListenerEvents> {
+    &mut self.publisher
+  }
+
+  pub fn is_open(&self) -> bool {
     match self.state {
       ListenerState::Connected(_) => true,
       _ => false,
     }
   }
 
-  fn next(self: &mut Self) -> FutureMessage {
+  fn next(&mut self) -> FutureMessage<'_> {
     FutureMessage(self)
   }
 }
@@ -172,7 +207,6 @@ impl<'a> Future for FutureMessage<'a> {
       Closed => Poll::Ready(Ok(None)),
       _ => Poll::Pending,
     };
-    debug!("Listener poll result: {:?}", result);
     result
   }
 }

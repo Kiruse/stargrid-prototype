@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 futures-util = "0.3.30"
+iso8601-timestamp = "0.2.16"
 json = "0.12.4"
 log = "0.4.20"
 primitive-types = "0.12.2"
