@@ -1,14 +1,19 @@
+use listener::ListenerEvent;
 use log::*;
+use repeater::RepeaterCommands;
 
 mod listener;
 mod data;
 mod error;
+mod msg;
 mod repeater;
+mod util;
+
+use crate::error::StargridError;
+use crate::msg::Broadcast;
+use crate::util::LogError;
 
 type Result<T> = std::result::Result<T, error::StargridError>;
-pub use error::StargridError;
-
-// use repeater::Repeater;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,15 +25,33 @@ async fn main() -> Result<()> {
 	).unwrap();
 
 	let listener = listener::listen("wss://terra-rpc.publicnode.com:443/websocket".to_string()).await?;
-	let _repeater = repeater::repeat("127.0.0.1:27043".to_string()).await?;
+	let repeater = repeater::repeat("127.0.0.1:27043".to_string()).await?;
 
-	listener.subscribe(|event| {
-		use listener::ListenerEvent::*;
-		match event {
-			NewBlock(block) => info!("Block {} at {}", block.height, block.time),
-			_ => info!("Event: {:?}", event),
+	let mut rx_events = listener.events();
+	let repeater_commands = repeater.commands();
+
+	// propagate blocks & txs to repeater
+	tokio::spawn(async move {
+		let repeater_commands = RepeaterCommands(repeater_commands);
+		loop {
+			if let Err(err) = rx_events.changed().await {
+				error!("Failed to receive event: {}", err);
+				break;
+			}
+
+			let event = rx_events.borrow_and_update().clone();
+			match event {
+				ListenerEvent::Broadcast(ref broadcast) => {
+					repeater_commands.broadcast(broadcast.clone()).await.log_error();
+				}
+				ListenerEvent::Close => break,
+				_ => {},
+			}
 		}
-	});
+	}).await.log_error();
+
+	listener.join_handle.await.log_error();
+	repeater.join_handle.await.log_error();
 
 	Ok(())
 }

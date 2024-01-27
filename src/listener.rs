@@ -1,27 +1,29 @@
 use futures_util::{SinkExt, StreamExt};
-use json::{object, array};
 use log::*;
 use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream, MaybeTlsStream};
 use tungstenite::Message;
 use tungstenite::protocol::CloseFrame;
 
+use crate::msg::Broadcast;
 use crate::Result;
-use crate::data::{parse_block, Block};
+use crate::data::{parse_block, parse_tx, validate_jsonrpc, SUB_ID_BLOCK, SUB_ID_TX};
 use crate::error::StargridError;
+use crate::util::LogError;
 
 pub enum ListenerCommand {
   Close,
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub enum ListenerEvent {
   Initial,
   Connect,
   Reconnect,
-  NewBlock(Block),
+  Broadcast(Broadcast),
   Disconnect,
   Close,
 }
@@ -30,9 +32,10 @@ pub async fn listen(endpoint: String) -> Result<Listener> {
   let (tx_commands, rx_commands) = mpsc::channel(32);
   let (tx_events, rx_events) = watch::channel(ListenerEvent::Initial);
 
-  tokio::spawn(main_loop(endpoint, rx_commands, tx_events));
+  let join_handle = tokio::spawn(main_loop(endpoint, rx_commands, tx_events));
 
   Ok(Listener {
+    join_handle,
     tx_commands,
     rx_events,
   })
@@ -74,10 +77,13 @@ async fn main_loop(
               }
               Message::Binary(_) => error!("Unexpected binary message, skipping"),
               Message::Text(msg) => {
-                let res = parse_block(msg.as_str())
-                  .map(|block| tx_events.send(ListenerEvent::NewBlock(block)));
-                if let Err(err) = res {
-                  error!("Error parsing/sending block: {:?}", err);
+                match parse_text_msg(&msg) {
+                  Ok(data) => {
+                    try_send_event(&tx_events, ListenerEvent::Broadcast(data));
+                  }
+                  Err(err) => {
+                    error!("Error parsing message: {:?}", err);
+                  }
                 }
               }
               _ => todo!(),
@@ -96,9 +102,7 @@ async fn main_loop(
 }
 
 fn try_send_event(sender: &watch::Sender<ListenerEvent>, event: ListenerEvent) {
-  sender.send(event).unwrap_or_else(|err| {
-    error!("Error sending event: {:?}", err);
-  });
+  sender.send(event).log_error();
 }
 
 async fn connect(endpoint: String) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
@@ -128,41 +132,34 @@ async fn try_connect(endpoint: String) -> Result<WebSocketStream<MaybeTlsStream<
 
   if res.body().is_some() {
     error!("Unexpected body in response: {:?}", res.body().as_ref().unwrap());
-    return Err(StargridError::InvalidWSMessage("Unexpected body in connection response".into()));
+    return Err(StargridError::InvalidListenerMessage("Unexpected body in connection response".into()));
   }
 
   debug!("Connected to {}", endpoint);
 
   // subscribe to NewBlock events
-  ws.send(Message::Text(json::stringify(object! {
-    "jsonrpc" => "2.0",
-    "id" => 1,
-    "method" => "subscribe",
-    "params" => array!["tm.event='NewBlock'"],
-  }))).await?;
+  ws.send(Message::Text(msg_subscribe(SUB_ID_BLOCK, "NewBlock"))).await?;
+  let resid = parse_subscription_response(&next_msg(&mut ws).await?)?;
+  if resid != SUB_ID_BLOCK {
+    return Err(StargridError::InvalidListenerMessage(format!("Invalid subscription ID {}, expected 1", resid)));
+  }
 
-  let Some(res) = ws.next().await else {
-    return Err(StargridError::InvalidWSMessage("Unexpected EOF in connection response".into()));
-  };
-  let msg = res?;
-  match msg {
-    Message::Text(msg) => {
-      let msg = json::parse(msg.as_str())?;
-      if !msg.is_object() || msg["jsonrpc"] != "2.0" || msg["id"] != 1 {
-        return Err(StargridError::InvalidWSMessage("Invalid subscription response".into()));
-      }
-      debug!("Successfully subscribed to NewBlock events");
-    }
-    _ => {
-      return Err(StargridError::InvalidWSMessage("Unexpected subscription response".into()));
-    }
+  ws.send(Message::Text(msg_subscribe(SUB_ID_TX, "Tx"))).await?;
+  let resid = parse_subscription_response(&next_msg(&mut ws).await?)?;
+  if resid != SUB_ID_TX {
+    return Err(StargridError::InvalidListenerMessage(format!("Invalid subscription ID {}, expected 2", resid)));
   }
 
   Ok(ws)
 }
 
+async fn next_msg(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Message> {
+  Ok(ws.next().await.ok_or(StargridError::InvalidListenerMessage("Unexpected EOF in connection response".into()))??)
+}
+
 /// Listener API to simplify interacting with the Listener async/thread
 pub struct Listener {
+  pub join_handle: JoinHandle<()>,
   tx_commands: mpsc::Sender<ListenerCommand>,
   rx_events: watch::Receiver<ListenerEvent>,
 }
@@ -178,34 +175,44 @@ impl Listener {
       )
   }
 
-  pub fn subscribe(&self, mut callback: impl FnMut(ListenerEvent) + 'static + Send) {
-    let mut rx_events = self.rx_events.clone();
-    tokio::spawn(async move {
-      let mut closing = false;
-      while !closing {
-        let event = rx_events.borrow_and_update();
-        if let ListenerEvent::Close = *event {
-          closing = true;
-        }
-        callback(event.to_owned());
-      }
-    });
+  pub fn events(&self) -> watch::Receiver<ListenerEvent> {
+    self.rx_events.clone()
   }
 }
 
-trait LogError {
-  fn log_error(self);
-}
+fn parse_text_msg(msg: &str) -> Result<Broadcast> {
+  let msg: serde_json::Value = serde_json::from_str(msg)?;
+  validate_jsonrpc(&msg)?;
 
-impl<E> LogError for std::result::Result<(), E>
-where E: std::fmt::Debug
-{
-  fn log_error(self) {
-    match self {
-      Err(err) => {
-        error!("Error: {:?}", err);
-      }
-      _ => (),
+  match msg["id"].as_u64() {
+    Some(SUB_ID_BLOCK) => {
+      Ok(Broadcast::Block(parse_block(&msg)?))
     }
+    Some(SUB_ID_TX) => {
+      Ok(Broadcast::Tx(parse_tx(&msg)?))
+    }
+    _ => todo!(),
   }
+}
+
+fn msg_subscribe(id: u64, typ: impl Into<String>) -> String {
+  serde_json::json!({
+    "jsonrpc": "2.0",
+    "id": id,
+    "method": "subscribe",
+    "params": [format!("tm.event='{}'", typ.into())],
+  }).to_string()
+}
+
+fn parse_subscription_response(msg: &Message) -> Result<u64> {
+  let Message::Text(msg) = msg else {
+    return Err(StargridError::InvalidListenerMessage("Unexpected non-text subscription response".into()));
+  };
+
+  let response: serde_json::Value = serde_json::from_str(msg.as_str())?;
+
+  if response["jsonrpc"] != "2.0" {
+    return Err(StargridError::InvalidListenerMessage(format!("Invalid JSONRPC version (expected \"2.0\", got \"{}\")", response["jsonrpc"])));
+  }
+  Ok(response["id"].as_u64().ok_or(StargridError::InvalidListenerMessage("Missing subscription ID".into()))?)
 }
