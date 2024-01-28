@@ -10,7 +10,6 @@ mod repeater;
 mod util;
 
 use crate::error::StargridError;
-use crate::msg::Broadcast;
 use crate::util::LogError;
 
 type Result<T> = std::result::Result<T, error::StargridError>;

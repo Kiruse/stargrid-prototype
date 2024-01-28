@@ -23,6 +23,9 @@ pub enum StargridError {
   #[error("JSON Error: {0}")]
   JsonError(#[from] serde_json::Error),
 
+  #[error("Budget Error: {0}")]
+  BudgetError(String),
+
   #[error("{0}")]
   Generic(String),
 }

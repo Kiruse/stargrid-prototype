@@ -3,13 +3,14 @@ use std::{borrow::Cow, net::SocketAddr};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use serde_json::json;
 use log::*;
-use tokio::{net::{TcpListener, TcpStream}, select, sync::mpsc, task::JoinHandle};
+use tokio::{net::{TcpListener, TcpStream}, select, sync::{mpsc, watch}, task::JoinHandle};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tungstenite::{protocol::{frame::coding::CloseCode, CloseFrame}, Message};
 
-use crate::{msg::{Broadcast, RepeaterMessage}, util::LogError, Result, StargridError};
+use crate::{data::Tx, msg::{Broadcast, RepeaterMessage, RepeaterSubscription}, util::LogError, Result, StargridError};
 
 const MAX_MESSAGE_SIZE: usize = 4000;
+const MAX_FREE_SUBSCRIPTIONS: usize = 20;
 
 pub enum RepeaterCommand {
   Broadcast(Broadcast),
@@ -34,23 +35,37 @@ async fn main_loop(
   let listener = TcpListener::bind(endpoint.clone()).await.expect(format!("Failed to listen on {}", endpoint).as_str());
   info!("Listening on {}", endpoint);
 
+  let (tx_broadcast, rx_broadcast) = watch::channel(Broadcast::None);
+
   loop {
     select! {
       Ok((stream, _)) = listener.accept() => {
-        tokio::spawn(accept_connection(stream));
+        let rx_broadcast = rx_broadcast.clone();
+        tokio::spawn(async move {
+          accept_connection(stream, rx_broadcast.clone()).await.log_error();
+        });
       }
       Some(cmd) = rx_commands.recv() => {
-        use RepeaterCommand::*;
-        use crate::msg::Broadcast::*;
         match cmd {
-          Broadcast(Block(block)) => {
-            info!("Broadcasting block {}", block.height);
+          RepeaterCommand::Broadcast(broadcast) => {
+            match broadcast {
+              // note: we don't broadcast close broadcasts, it's considered an internal event and is
+              // not enforced when when emitted from the outside
+              Broadcast::Block(block) => {
+                info!("Broadcasting block {}", block.height);
+                tx_broadcast.send(Broadcast::Block(block)).log_error();
+              }
+              Broadcast::Tx(tx) => {
+                info!("Broadcasting tx {}", tx.txhash);
+                tx_broadcast.send(Broadcast::Tx(tx)).log_error();
+              }
+              _ => {}
+            }
           }
-          Broadcast(Tx(tx)) => {
-            info!("Broadcasting tx {}", tx.txhash);
-          }
-          Close => {
+          RepeaterCommand::Close => {
             info!("Closing repeater");
+            // close broadcast allows remote clients to close gracefully
+            tx_broadcast.send(Broadcast::Close).log_error();
             break;
           }
         }
@@ -61,55 +76,98 @@ async fn main_loop(
 
 async fn accept_connection(
   stream: TcpStream,
-  // tx_subscription: mpsc::Sender<RepeaterSubscription>,
-  // rx_broadcast: watch::Receiver<Broadcast>,
-) {
+  mut rx_broadcast: watch::Receiver<Broadcast>,
+) -> Result<()> {
   let peer = stream.peer_addr().expect("connected streams should have a peer address");
   info!("Peer {} connected", peer);
 
-  let ws = accept_async(stream).await.expect("Failed to accept");
+  let ws = accept_async(stream).await?;
   let (mut write, mut read) = ws.split();
+
+  let mut subscriptions: Vec<RepeaterSubscription> = vec![];
 
   // TODO: heartbeat ping/pong
 
-  while let Some(msg) = read.next().await {
-    if let Err(err) = handle_message(peer, &mut write, msg).await {
-      error!("Error reading from peer {}: {:?} - disconnecting.", peer, err);
-      write.send(Message::Close(Some(CloseFrame {
-        code: CloseCode::Abnormal,
-        reason: Cow::from("Error reading from peer (you)"),
-      }))).await.log_error();
-      write.close().await.log_error();
-      break;
+  loop {
+    select! {
+      Some(msg) = read.next() => {
+        let msg = msg?;
+        let ctx = ClientContext {
+          peer,
+          write: &mut write,
+          subscriptions: &mut subscriptions,
+        };
+
+        if let Err(err) = handle_message(ctx, msg).await {
+          error!("Error reading from peer {}: {:?} - disconnecting.", peer, err);
+          write.send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Abnormal,
+            reason: Cow::from("Error reading from peer (you)"),
+          }))).await.log_error();
+          write.close().await.log_error();
+          break;
+        }
+      }
+      Ok(()) = rx_broadcast.changed() => {
+        let ctx = ClientContext {
+          peer,
+          write: &mut write,
+          subscriptions: &mut subscriptions,
+        };
+
+        let broadcast = rx_broadcast.borrow_and_update().clone();
+        match broadcast {
+          Broadcast::Block(block) => {
+            if ctx.has_block_subscription() {
+              write.send(Message::text(
+                serde_json::to_string(&block)?
+              )).await.log_error();
+            }
+          }
+          Broadcast::Tx(tx) => {
+            if ctx.has_tx_subscription(&tx) {
+              debug!("Sending tx {} to {}", tx.txhash, peer);
+              write.send(Message::text(
+                serde_json::to_string(&tx)?
+              )).await.log_error();
+            }
+          }
+          Broadcast::Close => {
+            write.send(Message::Close(Some(CloseFrame {
+              code: CloseCode::Normal,
+              reason: Cow::from("Repeater closed"),
+            }))).await.log_error();
+            write.close().await.log_error();
+            break;
+          }
+          _ => {}
+        }
+      }
     }
   }
+
+  Ok(())
 }
 
-async fn handle_message(
-  peer: SocketAddr,
-  write: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
-  msg: std::result::Result<Message, tungstenite::Error>,
-) -> Result<()> {
-  let msg = msg?;
-
+async fn handle_message<'a>(mut ctx: ClientContext<'a>, msg: Message) -> Result<()> {
   match msg {
     Message::Close(_) => {
-      info!("Peer {} disconnected", peer);
-      write.close().await.log_error();
+      info!("Peer {} disconnected", ctx.peer);
+      ctx.write.close().await.log_error();
     }
     Message::Binary(_) => {
-      write.send(Message::text(
+      ctx.write.send(Message::text(
         json!({
           "error": "Binary messages not supported",
         }).to_string()
       )).await.log_error();
     }
     Message::Ping(_) => {
-      write.send(Message::Pong(vec![])).await.log_error();
+      ctx.write.send(Message::Pong(vec![])).await.log_error();
     }
     Message::Text(msg) => {
       if msg.len() > MAX_MESSAGE_SIZE {
-        write.send(Message::text(
+        ctx.write.send(Message::text(
           json!({
             "error": "Message too large (>4000 characters)",
           }).to_string()
@@ -117,14 +175,24 @@ async fn handle_message(
         return Ok(());
       }
 
-      let msg: RepeaterMessage = serde_json::from_str(&msg)
-        .map_err(|err| StargridError::InvalidFormat(format!("{}", err)))?;
-      todo!();
-      // match msg {
-      //   RepeaterMessage::Subscribe(msg) => {
-
-      //   }
-      // }
+      let msg: RepeaterMessage = serde_json::from_str(&msg)?;
+      debug!("Received message from {}: {:?}", ctx.peer, msg);
+      match msg {
+        RepeaterMessage::Subscribe(subscription) => {
+          match subscription {
+            RepeaterSubscription::Blocks => {
+              if !ctx.has_block_subscription() {
+                ctx.push_subscription(subscription)?;
+              }
+            }
+            RepeaterSubscription::Txs(ref tx) => {
+              // TODO: dedupe tx subscriptions efficiently
+              tx.validate()?;
+              ctx.push_subscription(subscription)?;
+            }
+          }
+        }
+      }
     }
     _ => unreachable!(),
   }
@@ -182,5 +250,44 @@ impl RepeaterCommands {
 
   pub async fn broadcast(&self, broadcast: Broadcast) -> Result<()> {
     cmd_broadcast(&self.0, broadcast).await
+  }
+}
+
+struct ClientContext<'a> {
+  peer: SocketAddr,
+  write: &'a mut SplitSink<WebSocketStream<TcpStream>, Message>,
+  subscriptions: &'a mut Vec<RepeaterSubscription>,
+}
+
+impl<'a> ClientContext<'a> {
+  pub fn has_block_subscription(&self) -> bool {
+    self.subscriptions.iter().find(|item| {
+      if let RepeaterSubscription::Blocks = item { true } else { false }
+    }).is_some()
+  }
+
+  /// find the first RepeaterSubscription that matches the given Tx - tho there can be more
+  pub fn find_tx_subscription(&self, tx: &Tx) -> Option<&RepeaterSubscription> {
+    self.subscriptions
+      .iter()
+      .find(|item| {
+        if let RepeaterSubscription::Txs(subscription) = item {
+          subscription.matches(tx)
+        } else {
+          false
+        }
+      })
+  }
+
+  pub fn has_tx_subscription(&self, tx: &Tx) -> bool {
+    self.find_tx_subscription(tx).is_some()
+  }
+
+  pub fn push_subscription(&mut self, subscription: RepeaterSubscription) -> Result<()> {
+    if self.subscriptions.len() >= MAX_FREE_SUBSCRIPTIONS {
+      return Err(StargridError::BudgetError("Too many subscriptions".into()))
+    }
+    self.subscriptions.push(subscription);
+    Ok(())
   }
 }
