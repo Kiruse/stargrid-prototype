@@ -28,7 +28,6 @@ pub struct Tx {
   pub error: Option<TxError>,
   #[serde(serialize_with = "crate::util::serialize_u256", deserialize_with = "crate::util::deserialize_u256")]
   pub height: U256,
-  // TODO: pub hash: String,
   pub tx: String,
   pub txhash: String,
   pub events: Vec<Event>,
