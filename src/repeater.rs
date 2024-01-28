@@ -126,7 +126,6 @@ async fn accept_connection(
           }
           Broadcast::Tx(tx) => {
             if ctx.has_tx_subscription(&tx) {
-              debug!("Sending tx {} to {}", tx.txhash, peer);
               write.send(Message::text(
                 json!({
                   "tx": &tx
