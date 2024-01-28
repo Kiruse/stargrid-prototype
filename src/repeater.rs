@@ -118,7 +118,9 @@ async fn accept_connection(
           Broadcast::Block(block) => {
             if ctx.has_block_subscription() {
               write.send(Message::text(
-                serde_json::to_string(&block)?
+                json!({
+                  "block": &block,
+                }).to_string()
               )).await.log_error();
             }
           }
@@ -126,7 +128,9 @@ async fn accept_connection(
             if ctx.has_tx_subscription(&tx) {
               debug!("Sending tx {} to {}", tx.txhash, peer);
               write.send(Message::text(
-                serde_json::to_string(&tx)?
+                json!({
+                  "tx": &tx
+                }).to_string()
               )).await.log_error();
             }
           }
