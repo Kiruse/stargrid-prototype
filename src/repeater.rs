@@ -188,12 +188,21 @@ async fn handle_message<'a>(mut ctx: ClientContext<'a>, msg: Message) -> Result<
               tx.validate()?;
 
               if ctx.has_tx_id(id) {
-                return Err(StargridError::Generic(format!("Subscription ID {} already in use", id)));
+                ctx.write.send(Message::text(
+                  json!({
+                    "subscription": json!({
+                      "id": id,
+                      "error": "Subscription ID already in use",
+                    }),
+                  }).to_string(),
+                )).await.log_error();
               } else {
                 ctx.push_subscription(subscription)?;
                 ctx.write.send(Message::text(
                   json!({
-                    "id": id,
+                    "subscription": json!({
+                      "id": id,
+                    }),
                   }).to_string()
                 )).await.log_error();
               }
