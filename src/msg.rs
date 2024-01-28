@@ -7,11 +7,13 @@ use crate::data::{Block, Tx};
 use crate::error::StargridError;
 
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all="camelCase")]
 pub enum RepeaterMessage {
   Subscribe(RepeaterSubscription),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all="camelCase")]
 pub enum RepeaterSubscription {
   /// Subscribe to whole blocks
   Blocks,
@@ -21,11 +23,14 @@ pub enum RepeaterSubscription {
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct RepeaterTxSubscription {
+  /// ID of this subscription unique to the client. If the ID is already in use, responds with an error.
+  pub id: u64,
   /// Filters for one or more event types and/or attributes. Cannot be empty. All filters must apply.
-  filters: HashMap<String, RepeaterTxFilter>,
+  pub filters: HashMap<String, RepeaterTxFilter>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all="camelCase")]
 pub enum RepeaterTxFilter {
   /// Filter event type or attribute by exact match
   Exact(String),
@@ -40,6 +45,7 @@ pub enum RepeaterTxFilter {
 }
 
 #[derive(Clone, Serialize, Debug)]
+#[serde(rename_all="camelCase")]
 pub enum Broadcast {
   /// Necessary non-event for tokio watch channels
   None,

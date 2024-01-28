@@ -99,13 +99,11 @@ async fn accept_connection(
         };
 
         if let Err(err) = handle_message(ctx, msg).await {
-          error!("Error reading from peer {}: {:?} - disconnecting.", peer, err);
-          write.send(Message::Close(Some(CloseFrame {
-            code: CloseCode::Abnormal,
-            reason: Cow::from("Error reading from peer (you)"),
-          }))).await.log_error();
-          write.close().await.log_error();
-          break;
+          write.send(Message::Text(
+            json!({
+              "error": format!("{}", err),
+            }).to_string()
+          )).await.log_error();
         }
       }
       Ok(()) = rx_broadcast.changed() => {
@@ -167,12 +165,7 @@ async fn handle_message<'a>(mut ctx: ClientContext<'a>, msg: Message) -> Result<
     }
     Message::Text(msg) => {
       if msg.len() > MAX_MESSAGE_SIZE {
-        ctx.write.send(Message::text(
-          json!({
-            "error": "Message too large (>4000 characters)",
-          }).to_string()
-        )).await.log_error();
-        return Ok(());
+        return Err(StargridError::Generic(format!("Message too large (>{} characters)", MAX_MESSAGE_SIZE)));
       }
 
       let msg: RepeaterMessage = serde_json::from_str(&msg)?;
@@ -187,8 +180,19 @@ async fn handle_message<'a>(mut ctx: ClientContext<'a>, msg: Message) -> Result<
             }
             RepeaterSubscription::Txs(ref tx) => {
               // TODO: dedupe tx subscriptions efficiently
+              let id = tx.id;
               tx.validate()?;
-              ctx.push_subscription(subscription)?;
+
+              if ctx.has_tx_id(id) {
+                return Err(StargridError::Generic(format!("Subscription ID {} already in use", id)));
+              } else {
+                ctx.push_subscription(subscription)?;
+                ctx.write.send(Message::text(
+                  json!({
+                    "id": id,
+                  }).to_string()
+                )).await.log_error();
+              }
             }
           }
         }
@@ -281,6 +285,19 @@ impl<'a> ClientContext<'a> {
 
   pub fn has_tx_subscription(&self, tx: &Tx) -> bool {
     self.find_tx_subscription(tx).is_some()
+  }
+
+  pub fn has_tx_id(&self, id: u64) -> bool {
+    self.subscriptions
+      .iter()
+      .find(|item| {
+        if let RepeaterSubscription::Txs(subscription) = item {
+          subscription.id == id
+        } else {
+          false
+        }
+      })
+      .is_some()
   }
 
   pub fn push_subscription(&mut self, subscription: RepeaterSubscription) -> Result<()> {
