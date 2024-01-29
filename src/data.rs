@@ -135,7 +135,7 @@ fn tx_payload(data: &Value) -> Result<Value> {
 
 fn get_tx_hash(bytes: &str) -> Result<String> {
   let bytes = base64::prelude::BASE64_STANDARD.decode(bytes)
-    .map_err(|err| StargridError::ParseError("Failed to decode tx bytes".into()))?;
+    .map_err(|_| StargridError::ParseError("Failed to decode tx bytes".into()))?;
   Ok(sha256::digest(bytes).to_uppercase())
 }
 
