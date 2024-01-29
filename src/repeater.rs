@@ -7,7 +7,7 @@ use tokio::{net::{TcpListener, TcpStream}, select, sync::{mpsc, watch}, task::Jo
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tungstenite::{protocol::{frame::coding::CloseCode, CloseFrame}, Message};
 
-use crate::{data::Tx, msg::{Broadcast, RepeaterMessage, RepeaterSubscription}, util::LogError, Result, StargridError};
+use crate::{data::Tx, msg::{Broadcast, RepeaterMessage, RepeaterSubscription, RepeaterTxSubscription}, util::LogError, Result, StargridError};
 
 const MAX_MESSAGE_SIZE: usize = 4000;
 const MAX_FREE_SUBSCRIPTIONS: usize = 20;
@@ -125,10 +125,12 @@ async fn accept_connection(
             }
           }
           Broadcast::Tx(tx) => {
-            if ctx.has_tx_subscription(&tx) {
+            if let Some(RepeaterSubscription::Txs(ref sub)) = ctx.find_tx_subscription(&tx) {
+              let id = sub.id;
               write.send(Message::text(
                 json!({
-                  "tx": &tx
+                  "id": id,
+                  "tx": &tx,
                 }).to_string()
               )).await.log_error();
             }
