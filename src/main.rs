@@ -1,3 +1,5 @@
+use std::env;
+
 use listener::ListenerEvent;
 use log::*;
 use repeater::RepeaterCommands;
@@ -23,8 +25,17 @@ async fn main() -> Result<()> {
 		simplelog::ColorChoice::Auto,
 	).unwrap();
 
-	let listener = listener::listen("wss://terra-rpc.publicnode.com:443/websocket".to_string()).await?;
-	let repeater = repeater::repeat("127.0.0.1:27043".to_string()).await?;
+	let args: Vec<String> = env::args().collect();
+	let remote = getarg(&args, &["-r", "--remote"], "wss://terra-rpc.publicnode.com:443/websocket");
+	let localhost = getarg(&args, &["-h", "--host"], "0.0.0.0");
+	let port_ = getarg(&args, &["-p", "--port"], "5566");
+	let Ok(port) = port_.parse::<u64>() else {
+		error!("Failed to parse port: {}", port_);
+		return Err(StargridError::Generic("Failed to parse port".into()));
+	};
+
+	let listener = listener::listen(remote.to_string()).await?;
+	let repeater = repeater::repeat(format!("{}:{}", localhost, port).to_string()).await?;
 
 	let mut rx_events = listener.events();
 	let repeater_commands = repeater.commands();
@@ -53,4 +64,12 @@ async fn main() -> Result<()> {
 	repeater.join_handle.await.log_error();
 
 	Ok(())
+}
+
+fn getarg<'a>(args: &'a Vec<String>, names: &[&'a str], default: &'a str) -> &'a str {
+	args
+		.iter()
+		.find(|arg| names.iter().any(|name| arg == name))
+		.map(|arg| arg.as_str())
+		.unwrap_or(default)
 }
