@@ -7,7 +7,7 @@ use tokio::{net::{TcpListener, TcpStream}, select, sync::{mpsc, watch}, task::Jo
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tungstenite::{protocol::{frame::coding::CloseCode, CloseFrame}, Message};
 
-use crate::{data::Tx, msg::{Broadcast, RepeaterMessage, RepeaterSubscription, RepeaterTxSubscription}, util::LogError, Result, StargridError};
+use crate::{data::Tx, msg::{Broadcast, RepeaterMessage, RepeaterSubscription}, util::LogError, Result, StargridError};
 
 const MAX_MESSAGE_SIZE: usize = 4000;
 const MAX_FREE_SUBSCRIPTIONS: usize = 20;
@@ -186,7 +186,6 @@ async fn handle_message<'a>(mut ctx: ClientContext<'a>, msg: Message) -> Result<
             RepeaterSubscription::Txs(ref tx) => {
               // TODO: dedupe tx subscriptions efficiently
               let id = tx.id;
-              tx.validate()?;
 
               if ctx.has_tx_id(id) {
                 ctx.write.send(Message::text(
@@ -295,10 +294,6 @@ impl<'a> ClientContext<'a> {
           false
         }
       })
-  }
-
-  pub fn has_tx_subscription(&self, tx: &Tx) -> bool {
-    self.find_tx_subscription(tx).is_some()
   }
 
   pub fn has_tx_id(&self, id: u64) -> bool {

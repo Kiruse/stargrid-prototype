@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
-use crate::data::{Block, Tx};
-use crate::error::StargridError;
+use crate::data::{AttributeValue, Block, Tx};
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all="camelCase")]
@@ -26,22 +24,30 @@ pub struct RepeaterTxSubscription {
   /// ID of this subscription unique to the client. If the ID is already in use, responds with an error.
   pub id: u64,
   /// Filters for one or more event types and/or attributes. Cannot be empty. All filters must apply.
-  pub filters: HashMap<String, RepeaterTxFilter>,
+  pub filters: Vec<EventFilter>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct EventFilter {
+  /// Name of the event to filter for
+  name: String,
+  /// Attribute filters to apply
+  attributes: HashMap<String, AttributeFilter>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all="camelCase")]
-pub enum RepeaterTxFilter {
-  /// Filter event type or attribute by exact match
-  Exact(String),
-  /// Filter event type or attribute by prefix match
-  StartsWith(String),
-  /// Filter event type or attribute by suffix match
-  EndsWith(String),
-  /// Filter event type or attribute by substring inclusion
-  Contains(String),
-  /// Filter event type or attribute by simple glob pattern
-  Glob(String),
+pub enum AttributeFilter {
+  /// Exactly one of the given sub-filters
+  OneOf(Vec<AttributeFilter>),
+  /// At least one of the given sub-filters
+  AnyOf(Vec<AttributeFilter>),
+  /// All of the given sub-filters
+  AllOf(Vec<AttributeFilter>),
+  /// Invert the given sub-filter
+  Not(Box<AttributeFilter>),
+  /// Glob-like matching
+  Match(String),
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -58,63 +64,61 @@ pub enum Broadcast {
 }
 
 impl RepeaterTxSubscription {
-  pub fn validate(&self) -> Result<()> {
-    for (key, filter) in self.filters.iter() {
-      key.split_once(".").ok_or(StargridError::InvalidFormat("Filter key must be in format <type>.<attribute>".into()))?;
-      if let RepeaterTxFilter::Glob(_) = filter {
-        return Err(StargridError::InvalidFormat("Glob filters are not supported yet".into()));
-      }
-    }
-    Ok(())
-  }
-
   pub fn matches(&self, tx: &Tx) -> bool {
-    for (key, filter) in self.filters.iter() {
-      use RepeaterTxFilter::*;
-      let (event, attr) = key.split_once(".").unwrap();
+    self.filters.iter().all(|filter| filter.matches(tx))
+  }
+}
 
-      let event = tx.events
-        .iter()
-        .find(|item| item.name == event);
-      let Some(event) = event else {
-        return false;
-      };
+impl EventFilter {
+  pub fn matches(&self, tx: &Tx) -> bool {
+    tx.events
+      .iter()
+      .filter(|e| e.name == self.name)
+      .any(|e| {
+        if self.attributes.is_empty() {
+          return true;
+        }
 
-      let attr = event.attributes
-        .iter()
-        .find(|(key, _)| *key == attr);
-      let Some(attr) = attr else {
-        return false;
-      };
+        self.attributes.iter().all(|(key, filter)| {
+          e.attributes.iter().any(|(k, v)| {
+            k == key && filter.matches(v)
+          })
+        })
+      })
+  }
+}
 
-      let Some(val) = attr.1.value.as_str() else {
-        return false;
-      };
-
-      match filter {
-        Exact(value) => {
-          if val != value {
-            return false;
+impl AttributeFilter {
+  pub fn matches(&self, av: &AttributeValue) -> bool {
+    use AttributeFilter::*;
+    let Some(mut value) = av.value.as_str() else { return false; };
+    match self {
+      Match(pattern) => {
+        let parts: Vec<&str> = pattern.split("*").collect();
+        for part in &parts {
+          if part.is_empty() || *part == "*" { continue; }
+          match value.find(part) {
+            Some(idx) => {
+              value = &value[idx + part.len()..];
+            }
+            None => return false,
           }
         }
-        StartsWith(value) => {
-          if !val.starts_with(value) {
-            return false;
-          }
+
+        if parts[parts.len() - 1] == "*" {
+          true
+        } else {
+          value.is_empty()
         }
-        EndsWith(value) => {
-          if !val.ends_with(value) {
-            return false;
-          }
-        }
-        Contains(value) => {
-          if !val.contains(value) {
-            return false;
-          }
-        }
-        Glob(_) => todo!(),
       }
+      AllOf(filters) =>
+        filters.iter().all(|filter| filter.matches(av)),
+      AnyOf(filters) =>
+        filters.iter().any(|filter| filter.matches(av)),
+      OneOf(filters) =>
+        filters.iter().find(|filter| filter.matches(av)).is_some(),
+      Not(filter) =>
+        !filter.matches(av),
     }
-    true
   }
 }
