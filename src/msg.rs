@@ -39,8 +39,6 @@ pub struct EventFilter {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all="camelCase")]
 pub enum AttributeFilter {
-  /// Exactly one of the given sub-filters
-  OneOf(Vec<AttributeFilter>),
   /// At least one of the given sub-filters
   AnyOf(Vec<AttributeFilter>),
   /// All of the given sub-filters
@@ -126,15 +124,13 @@ impl AttributeFilter {
         rxpat.push_str("$");
 
         let Ok(rx) = Regex::new(&rxpat) else { return false };
-        // debug!("{} =~ {}", value, rxpat);
+        // log::debug!("{} =~ {} == {}", value, rxpat, rx.is_match(value));
         rx.is_match(value)
       }
       AllOf(filters) =>
         filters.iter().all(|filter| filter.matches(av)),
       AnyOf(filters) =>
         filters.iter().any(|filter| filter.matches(av)),
-      OneOf(filters) =>
-        filters.iter().find(|filter| filter.matches(av)).is_some(),
       Not(filter) =>
         !filter.matches(av),
     }
