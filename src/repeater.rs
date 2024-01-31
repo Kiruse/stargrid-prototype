@@ -7,7 +7,7 @@ use tokio::{net::{TcpListener, TcpStream}, select, sync::{mpsc, watch}, task::Jo
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tungstenite::{protocol::{frame::coding::CloseCode, CloseFrame}, Message};
 
-use crate::{data::Tx, msg::{Broadcast, RepeaterMessage, RepeaterSubscription}, util::LogError, Result, StargridError};
+use crate::{msg::{Broadcast, RepeaterMessage, RepeaterSubscription}, util::LogError, Result, StargridError};
 
 const MAX_MESSAGE_SIZE: usize = 4000;
 const MAX_FREE_SUBSCRIPTIONS: usize = 20;
@@ -107,15 +107,15 @@ async fn accept_connection(
         }
       }
       Ok(()) = rx_broadcast.changed() => {
-        let ctx = ClientContext {
-          peer,
-          write: &mut write,
-          subscriptions: &mut subscriptions,
-        };
-
         let broadcast = rx_broadcast.borrow_and_update().clone();
         match broadcast {
           Broadcast::Block(block) => {
+            let ctx = ClientContext {
+              peer,
+              write: &mut write,
+              subscriptions: &mut subscriptions,
+            };
+
             if ctx.has_block_subscription() {
               write.send(Message::text(
                 json!({
@@ -125,12 +125,24 @@ async fn accept_connection(
             }
           }
           Broadcast::Tx(tx) => {
-            if let Some(RepeaterSubscription::Txs(ref sub)) = ctx.find_tx_subscription(&tx) {
+            let subs = subscriptions
+              .iter()
+              .filter(|item| {
+                if let RepeaterSubscription::Txs(subscription) = item {
+                  subscription.matches(&tx)
+                } else {
+                  false
+                }
+              });
+            for sub in subs {
+              let RepeaterSubscription::Txs(ref sub) = sub else { continue };
               let id = sub.id;
               write.send(Message::text(
                 json!({
-                  "id": id,
-                  "tx": &tx,
+                  "subscription": json!({
+                    "id": id,
+                    "tx": &tx,
+                  }),
                 }).to_string()
               )).await.log_error();
             }
@@ -281,19 +293,6 @@ impl<'a> ClientContext<'a> {
     self.subscriptions.iter().find(|item| {
       if let RepeaterSubscription::Blocks = item { true } else { false }
     }).is_some()
-  }
-
-  /// find the first RepeaterSubscription that matches the given Tx - tho there can be more
-  pub fn find_tx_subscription(&self, tx: &Tx) -> Option<&RepeaterSubscription> {
-    self.subscriptions
-      .iter()
-      .find(|item| {
-        if let RepeaterSubscription::Txs(subscription) = item {
-          subscription.matches(tx)
-        } else {
-          false
-        }
-      })
   }
 
   pub fn has_tx_id(&self, id: u64) -> bool {
