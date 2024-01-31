@@ -39,6 +39,8 @@ pub struct EventFilter {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all="camelCase")]
 pub enum AttributeFilter {
+  /// Exactly one of the given sub-filters
+  OneOf(Vec<AttributeFilter>),
   /// At least one of the given sub-filters
   AnyOf(Vec<AttributeFilter>),
   /// All of the given sub-filters
@@ -131,6 +133,8 @@ impl AttributeFilter {
         filters.iter().all(|filter| filter.matches(av)),
       AnyOf(filters) =>
         filters.iter().any(|filter| filter.matches(av)),
+      OneOf(filters) =>
+        filters.iter().filter(|filter| filter.matches(av)).count() == 1,
       Not(filter) =>
         !filter.matches(av),
     }
