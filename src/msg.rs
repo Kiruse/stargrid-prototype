@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use log::*;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::data::{AttributeValue, Block, Tx};
@@ -91,25 +93,42 @@ impl EventFilter {
 impl AttributeFilter {
   pub fn matches(&self, av: &AttributeValue) -> bool {
     use AttributeFilter::*;
-    let Some(mut value) = av.value.as_str() else { return false; };
+    let Some(value) = av.value.as_str() else { return false; };
     match self {
       Match(pattern) => {
-        let parts: Vec<&str> = pattern.split("*").collect();
-        for part in &parts {
-          if part.is_empty() || *part == "*" { continue; }
-          match value.find(part) {
-            Some(idx) => {
-              value = &value[idx + part.len()..];
-            }
-            None => return false,
-          }
+        enum Mode {
+          Normal,
+          Escape,
         }
 
-        if parts[parts.len() - 1] == "*" {
-          true
-        } else {
-          value.is_empty()
+        let mut rxpat = String::with_capacity(pattern.len() * 2);
+        let mut mode = Mode::Normal;
+
+        rxpat.push_str("^");
+        for c in pattern.chars() {
+          match c {
+            '*' => rxpat.push_str(".*"),
+            '?' => rxpat.push_str("."),
+            '\\' => {
+              mode = Mode::Escape;
+            }
+            _ => {
+              match mode {
+                Mode::Normal => rxpat.push(c),
+                Mode::Escape => {
+                  rxpat.push('\\');
+                  rxpat.push(c);
+                  mode = Mode::Normal;
+                }
+              }
+            }
+          }
         }
+        rxpat.push_str("$");
+
+        let Ok(rx) = Regex::new(&rxpat) else { return false };
+        // debug!("{} =~ {}", value, rxpat);
+        rx.is_match(value)
       }
       AllOf(filters) =>
         filters.iter().all(|filter| filter.matches(av)),
