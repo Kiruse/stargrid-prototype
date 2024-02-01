@@ -76,10 +76,6 @@ impl EventFilter {
       .iter()
       .filter(|e| e.name == self.name)
       .any(|e| {
-        if self.attributes.is_empty() {
-          return true;
-        }
-
         self.attributes.iter().all(|(key, filter)| {
           e.attributes.iter().any(|(k, v)| {
             k == key && filter.matches(v)

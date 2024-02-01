@@ -56,7 +56,7 @@ async fn main_loop(
                 tx_broadcast.send(Broadcast::Block(block)).log_error();
               }
               Broadcast::Tx(tx) => {
-                info!("Broadcasting tx {}", tx.txhash);
+                // info!("Broadcasting tx {}", tx.txhash);
                 tx_broadcast.send(Broadcast::Tx(tx)).log_error();
               }
               _ => {}
@@ -139,7 +139,7 @@ async fn accept_connection(
               let id = sub.id;
               write.send(Message::text(
                 json!({
-                  "subscription": json!({
+                  "tx": json!({
                     "id": id,
                     "tx": &tx,
                   }),
